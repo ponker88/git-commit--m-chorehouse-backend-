@@ -35,10 +35,10 @@ function saveData(data) {
 function getDefaultData() {
   return {
     members: [
-      { id: 1, name: "Alex",   email: "", color: "#E8A87C" },
+      { id: 1, name: "Alex", email: "", color: "#E8A87C" },
       { id: 2, name: "Jordan", email: "", color: "#85C1E9" },
-      { id: 3, name: "Sam",    email: "", color: "#82E0AA" },
-      { id: 4, name: "Riley",  email: "", color: "#F1948A" },
+      { id: 3, name: "Sam", email: "", color: "#82E0AA" },
+      { id: 4, name: "Riley", email: "", color: "#F1948A" },
     ],
     chores: [],
     tasks: [],
@@ -66,7 +66,7 @@ function generateSchedule(members, chores, weekOffset) {
   DAYS.forEach(day => { schedule[day] = {}; members.forEach(m => { schedule[day][m.id] = null; }); });
   const choreAssignments = {};
   chores.forEach(chore => {
-    const dpw = FREQ_DAYS[chore.frequency] ?? 1;
+    const dpw = FREQ_DAYS[chore.frequency] || 1;
     let activeDays = [];
     if (dpw === 7) activeDays = [...DAYS];
     else if (dpw === 5) activeDays = DAYS.slice(0, 5);
@@ -110,6 +110,17 @@ async function sendReminderEmail(member, chore, token) {
   });
 }
 
+async function sendTaskEmail(member, task) {
+  await resend.emails.send({
+    from: FROM_EMAIL,
+    to: member.email,
+    subject: "Task reminder - " + task.title,
+    html: "<div style='font-family:monospace;max-width:480px;background:#0F0E0C;color:#E8E2D9;border-radius:12px;padding:32px;'><div style='font-size:20px;font-weight:700;color:#E8A87C;'>chorehouse</div><hr style='border:none;border-top:1px solid rgba(255,255,255,0.1);margin:16px 0;'/><p style='color:rgba(232,226,217,0.7);'>Hey <strong style='color:#E8E2D9;'>" + member.name + "</strong>, you have a task to complete:</p><div style='background:rgba(255,255,255,0.05);border-left:3px solid " + member.color + ";border-radius:8px;padding:16px 20px;margin:20px 0;'><div style='font-size:18px;color:#E8E2D9;font-weight:600;'>" + task.title + "</div>" + (task.notes ? "<div style='font-size:12px;color:rgba(232,226,217,0.5);margin-top:6px;'>" + task.notes + "</div>" : "") + "<div style='font-size:10px;color:rgba(232,226,217,0.35);margin-top:8px;text-transform:uppercase;letter-spacing:1px;'>" + task.priority + " priority</div></div><p style='font-size:12px;color:rgba(232,226,217,0.4);'>Mark this task done in the Chorehouse dashboard to stop reminders.</p></div>",
+  });
+}
+
+const taskReminders = {};
+
 async function runAlerts(alertIndex) {
   const data = loadData();
   if (!data.alertEnabled[alertIndex]) return;
@@ -145,6 +156,17 @@ function scheduleCrons() {
     cron.schedule(m + " " + h + " * * *", () => runAlerts(i), { timezone: process.env.TZ || "America/Los_Angeles" });
     console.log("Scheduled alert " + (i + 1) + " at " + time);
   });
+  cron.schedule("0 * * * *", async () => {
+    console.log("Hourly task reminder check at " + new Date().toISOString());
+    for (const id of Object.keys(taskReminders)) {
+      const entry = taskReminders[id];
+      if (!entry || entry.done) { delete taskReminders[id]; continue; }
+      try {
+        await sendTaskEmail(entry.member, entry.task);
+        console.log("Hourly task reminder sent: " + entry.task.title + " -> " + entry.member.name);
+      } catch (e) { console.error("Hourly task reminder failed:", e.message); }
+    }
+  }, { timezone: process.env.TZ || "America/Los_Angeles" });
 }
 
 app.get("/complete/:token", (req, res) => {
@@ -158,6 +180,7 @@ app.get("/complete/:token", (req, res) => {
 });
 
 app.get("/data", (req, res) => res.json(loadData()));
+
 app.post("/data", (req, res) => {
   const data = loadData();
   if (req.body.members) data.members = req.body.members;
@@ -166,6 +189,26 @@ app.post("/data", (req, res) => {
   if (req.body.alertTimes) data.alertTimes = req.body.alertTimes;
   if (req.body.alertEnabled) data.alertEnabled = req.body.alertEnabled;
   saveData(data);
+  res.json({ ok: true });
+});
+
+app.post("/task-notify", async (req, res) => {
+  const { task, member } = req.body;
+  if (!task || !member || !member.email) return res.status(400).json({ error: "Missing task or member" });
+  try {
+    await sendTaskEmail(member, task);
+    taskReminders[task.id] = { task, member, done: false };
+    console.log("Task notification sent: " + task.title + " -> " + member.name);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Task email failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/task-complete", (req, res) => {
+  const { taskId } = req.body;
+  if (taskReminders[taskId]) delete taskReminders[taskId];
   res.json({ ok: true });
 });
 
