@@ -1,0 +1,18 @@
+{
+  "name": "chorehouse-backend",
+  "version": "1.0.0",
+  "description": "Chorehouse email alert backend",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-cron": "^3.0.3",
+    "resend": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
