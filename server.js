@@ -7,11 +7,8 @@ import express from "express";
 import cron from "node-cron";
 import { Resend } from "resend";
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import pg from "pg";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.use(express.json());
 
@@ -26,17 +23,56 @@ app.use((req, res, next) => {
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM_EMAIL = process.env.FROM_EMAIL || "chorehouse@yourdomain.com";
-const DATA_FILE = path.join(__dirname, "data.json");
 
-// ── Persistence (simple JSON file — fine for household scale) ──────────────
-function loadData() {
-  if (!fs.existsSync(DATA_FILE)) return getDefaultData();
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
-  catch { return getDefaultData(); }
+// ── Persistence (Postgres via Supabase — survives restarts/redeploys) ──────
+const { Pool } = pg;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chorehouse_data (
+      id INTEGER PRIMARY KEY DEFAULT 1,
+      data JSONB NOT NULL,
+      CONSTRAINT single_row CHECK (id = 1)
+    );
+  `);
+  const { rows } = await pool.query(`SELECT data FROM chorehouse_data WHERE id = 1;`);
+  if (rows.length === 0) {
+    await pool.query(
+      `INSERT INTO chorehouse_data (id, data) VALUES (1, $1::jsonb);`,
+      [JSON.stringify(getDefaultData())]
+    );
+    console.log("No existing row found — initialized chorehouse_data with default data.");
+  } else {
+    const d = rows[0].data;
+    console.log(`Existing data found: ${d.members?.length ?? 0} members, ${d.chores?.length ?? 0} chores.`);
+  }
 }
 
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+async function loadData() {
+  const { rows } = await pool.query(`SELECT data FROM chorehouse_data WHERE id = 1;`);
+  if (rows.length === 0) {
+    const def = getDefaultData();
+    await pool.query(
+      `INSERT INTO chorehouse_data (id, data) VALUES (1, $1::jsonb);`,
+      [JSON.stringify(def)]
+    );
+    return def;
+  }
+  // pg auto-parses JSONB columns back into JS objects on read, so rows[0].data
+  // is already a JS object here — no JSON.parse needed on this side.
+  return rows[0].data;
+}
+
+async function saveData(data) {
+  await pool.query(
+    `INSERT INTO chorehouse_data (id, data) VALUES (1, $1::jsonb)
+     ON CONFLICT (id) DO UPDATE SET data = $1::jsonb;`,
+    [JSON.stringify(data)]
+  );
 }
 
 function getDefaultData() {
@@ -48,18 +84,24 @@ function getDefaultData() {
       { id: 4, name: "Riley",  email: "", color: "#F1948A" },
     ],
     chores: [
-      { id: 1, name: "Vacuum living room", frequency: "2x",     category: "Cleaning"     },
-      { id: 2, name: "Wash dishes",        frequency: "daily",  category: "Kitchen"      },
-      { id: 3, name: "Take out trash",     frequency: "2x",     category: "Maintenance"  },
-      { id: 4, name: "Mop floors",         frequency: "weekly", category: "Cleaning"     },
-      { id: 5, name: "Clean bathrooms",    frequency: "2x",     category: "Cleaning"     },
-      { id: 6, name: "Laundry",            frequency: "2x",     category: "Laundry"      },
-      { id: 7, name: "Grocery run",        frequency: "weekly", category: "Errands"      },
-      { id: 8, name: "Wipe counters",      frequency: "daily",  category: "Kitchen"      },
+      // fixedDays: only used by "weekly" chores — array of day abbreviations (e.g. ["Mon"])
+      // eligibleMemberIds: which member ids this chore rotates among. [] or omitted = all members.
+      // rotationIndex: persisted cursor into the eligible pool for fair round-robin rotation.
+      { id: 1, name: "Vacuum living room", frequency: "2x",     category: "Cleaning",    eligibleMemberIds: [], rotationIndex: 0 },
+      { id: 2, name: "Wash dishes",        frequency: "daily",  category: "Kitchen",     eligibleMemberIds: [], rotationIndex: 0 },
+      { id: 3, name: "Take out trash",     frequency: "weekly", category: "Maintenance", eligibleMemberIds: [], rotationIndex: 0, fixedDays: ["Thu"] },
+      { id: 4, name: "Mop floors",         frequency: "weekly", category: "Cleaning",    eligibleMemberIds: [], rotationIndex: 0, fixedDays: ["Mon"] },
+      { id: 5, name: "Clean bathrooms",    frequency: "2x",     category: "Cleaning",    eligibleMemberIds: [], rotationIndex: 0 },
+      { id: 6, name: "Laundry",            frequency: "2x",     category: "Laundry",     eligibleMemberIds: [], rotationIndex: 0 },
+      { id: 7, name: "Grocery run",        frequency: "weekly", category: "Errands",     eligibleMemberIds: [], rotationIndex: 0, fixedDays: ["Sat"] },
+      { id: 8, name: "Wipe counters",      frequency: "daily",  category: "Kitchen",     eligibleMemberIds: [], rotationIndex: 0 },
     ],
     tasks: [],
     // Map of "YYYY-MM-DD:memberId" → { choreId, done, token }
     dailyLog: {},
+    // Tracks the last ISO week number we advanced rotation for, so we only
+    // advance each chore's rotationIndex once per week even with multiple requests.
+    lastRotationWeek: null,
     alertTimes: ["08:00", "12:00", "17:00"],
     alertEnabled: [true, true, true],
   };
@@ -81,15 +123,79 @@ function getTodayDayName() {
   return DAYS[d === 0 ? 6 : d - 1];
 }
 
-function generateSchedule(members, chores, weekOffset) {
+// Returns the pool of members eligible for a chore (falls back to everyone
+// if the chore has no restriction set, or the restriction is empty/invalid).
+function eligiblePoolFor(chore, members) {
+  const ids = chore.eligibleMemberIds;
+  if (!ids || ids.length === 0) return members;
+  const pool = members.filter(m => ids.includes(m.id));
+  return pool.length > 0 ? pool : members; // safety fallback
+}
+
+// Advances each weekly, fixed-day chore's rotationIndex exactly once per
+// calendar week (so the *next* week's assignee moves forward by one within
+// that chore's own eligible pool — giving a true even round-robin even when
+// pool sizes differ chore-to-chore, e.g. a 2-person chore cycles every 2
+// weeks while a 4-person chore cycles every 4).
+function advanceWeeklyRotationsIfNeeded(data) {
+  const weekOffset = getWeekOffset();
+  if (data.lastRotationWeek === weekOffset) return false; // already advanced this week
+  const isFirstRun = data.lastRotationWeek === null;
+  data.chores.forEach(chore => {
+    if (chore.frequency !== "weekly") return;
+    const pool = eligiblePoolFor(chore, data.members);
+    if (!isFirstRun) {
+      chore.rotationIndex = ((chore.rotationIndex || 0) + 1) % pool.length;
+    } else {
+      // First time the server has ever run rotation: keep index 0, just clamp to pool size.
+      chore.rotationIndex = (chore.rotationIndex || 0) % pool.length;
+    }
+  });
+  data.lastRotationWeek = weekOffset;
+  return true;
+}
+
+function generateSchedule(data) {
+  const { members, chores } = data;
+  const weekOffset = getWeekOffset();
   const schedule = {};
   DAYS.forEach(day => {
     schedule[day] = {};
     members.forEach(m => { schedule[day][m.id] = null; });
   });
 
-  const choreAssignments = {};
-  chores.forEach(chore => {
+  // Track which non-weekly slots are filled per day so daily/2x chores
+  // still avoid double-booking a member on the same day.
+  function placeOnDay(day, chore, member) {
+    if (!schedule[day][member.id]) {
+      schedule[day][member.id] = chore;
+      return true;
+    }
+    return false;
+  }
+
+  chores.forEach((chore, i) => {
+    const pool = eligiblePoolFor(chore, members);
+
+    if (chore.frequency === "weekly") {
+      // Feature 1 + 2 + 3: fixed day(s), restricted pool, fair rotation.
+      const days = (chore.fixedDays && chore.fixedDays.length > 0) ? chore.fixedDays : [DAYS[weekOffset % 7]];
+      const idx = (chore.rotationIndex || 0) % pool.length;
+      const assignee = pool[idx];
+      days.forEach(day => {
+        if (!placeOnDay(day, chore, assignee)) {
+          // Slot taken (rare collision) — try next person in this chore's own pool.
+          for (let offset = 1; offset < pool.length; offset++) {
+            const candidate = pool[(idx + offset) % pool.length];
+            if (placeOnDay(day, chore, candidate)) break;
+          }
+        }
+      });
+      return;
+    }
+
+    // Daily / 2x / etc — unchanged auto-rotating behavior, but now respects
+    // the chore's eligible pool (feature 2) instead of always using all members.
     const dpw = FREQ_DAYS[chore.frequency] ?? 1;
     let activeDays = [];
     if (dpw === 7) activeDays = [...DAYS];
@@ -97,19 +203,13 @@ function generateSchedule(members, chores, weekOffset) {
     else if (dpw === 3) activeDays = [DAYS[0], DAYS[2], DAYS[4]];
     else if (dpw === 2) activeDays = [DAYS[0], DAYS[3]];
     else activeDays = [DAYS[weekOffset % 7]];
-    choreAssignments[chore.id] = activeDays;
-  });
 
-  [...chores].forEach((chore, i) => {
-    const memberIndex = (i + weekOffset) % members.length;
-    const primaryMember = members[memberIndex];
-    const days = choreAssignments[chore.id] || [];
-    days.forEach(day => {
-      if (!schedule[day][primaryMember.id]) {
-        schedule[day][primaryMember.id] = chore;
-      } else {
-        const other = members.find(m => m.id !== primaryMember.id && !schedule[day][m.id]);
-        if (other) schedule[day][other.id] = chore;
+    const memberIndex = (i + weekOffset) % pool.length;
+    const primaryMember = pool[memberIndex];
+    activeDays.forEach(day => {
+      if (!placeOnDay(day, chore, primaryMember)) {
+        const other = pool.find(m => m.id !== primaryMember.id && !schedule[day][m.id]);
+        if (other) placeOnDay(day, chore, other);
       }
     });
   });
@@ -181,14 +281,17 @@ async function sendReminderEmail(member, chore, token) {
 
 // ── Core daily job ─────────────────────────────────────────────────────────
 async function runAlerts(alertIndex) {
-  const data = loadData();
-  const { members, chores, alertTimes, alertEnabled, dailyLog } = data;
+  const data = await loadData();
+  const { members, alertTimes, alertEnabled, dailyLog } = data;
   if (!alertEnabled[alertIndex]) return;
+
+  // Feature 3: advance each weekly chore's fair-rotation cursor once per week.
+  const advanced = advanceWeeklyRotationsIfNeeded(data);
+  if (advanced) await saveData(data);
 
   const today = new Date().toISOString().split("T")[0];
   const dayName = getTodayDayName();
-  const weekOffset = getWeekOffset();
-  const schedule = generateSchedule(members, chores, weekOffset);
+  const schedule = generateSchedule(data);
 
   for (const member of members) {
     if (!member.email) continue;
@@ -205,13 +308,13 @@ async function runAlerts(alertIndex) {
       // Morning: always send and create log entry
       const token = makeToken();
       data.dailyLog[logKey] = { choreId: chore.id, done: false, token };
-      saveData(data);
+      await saveData(data);
       try { await sendChoreEmail(member, chore, token); }
       catch (e) { console.error(`Email failed for ${member.name}:`, e.message); }
     } else {
       // Follow-up: only send if not done
       const token = existing?.token || makeToken();
-      if (!existing) { data.dailyLog[logKey] = { choreId: chore.id, done: false, token }; saveData(data); }
+      if (!existing) { data.dailyLog[logKey] = { choreId: chore.id, done: false, token }; await saveData(data); }
       try { await sendReminderEmail(member, chore, token); }
       catch (e) { console.error(`Reminder failed for ${member.name}:`, e.message); }
     }
@@ -226,8 +329,8 @@ function parseCron(timeStr) {
   return `${m} ${h} * * *`;
 }
 
-function scheduleCrons() {
-  const data = loadData();
+async function scheduleCrons() {
+  const data = await loadData();
   data.alertTimes.forEach((time, i) => {
     cron.schedule(parseCron(time), () => runAlerts(i), { timezone: process.env.TZ || "America/Los_Angeles" });
     console.log(`Scheduled alert ${i + 1} at ${time}`);
@@ -237,9 +340,9 @@ function scheduleCrons() {
 // ── Routes ─────────────────────────────────────────────────────────────────
 
 // Mark complete via email link
-app.get("/complete/:token", (req, res) => {
+app.get("/complete/:token", async (req, res) => {
   const { token } = req.params;
-  const data = loadData();
+  const data = await loadData();
   const entry = Object.entries(data.dailyLog).find(([, v]) => v.token === token);
   if (!entry) return res.send(doneHtml("This link has expired or is invalid.", false));
 
@@ -247,7 +350,7 @@ app.get("/complete/:token", (req, res) => {
   if (val.done) return res.send(doneHtml("Already marked as done — nice work! ✓", true));
 
   data.dailyLog[key].done = true;
-  saveData(data);
+  await saveData(data);
   res.send(doneHtml("Chore marked as complete! Great work 🎉", true));
 });
 
@@ -263,23 +366,54 @@ function doneHtml(msg, success) {
 }
 
 // ── Data sync API (called by frontend to push config) ──────────────────────
-app.get("/data", (req, res) => res.json(loadData()));
+app.get("/data", async (req, res) => {
+  try {
+    const data = await loadData();
+    // Make sure rotation is current whenever the frontend asks for data too,
+    // so the displayed schedule always reflects the latest fair-rotation state.
+    const advanced = advanceWeeklyRotationsIfNeeded(data);
+    if (advanced) await saveData(data);
+    res.json({ ...data, schedule: generateSchedule(data) });
+  } catch (e) {
+    console.error("GET /data failed:", e.message, e.stack);
+    res.status(500).json({ error: e.message });
+  }
+});
 
-app.post("/data", (req, res) => {
-  const data = loadData();
-  const { members, chores, tasks, alertTimes, alertEnabled } = req.body;
-  if (members) data.members = members;
-  if (chores) data.chores = chores;
-  if (tasks) data.tasks = tasks;
-  if (alertTimes) data.alertTimes = alertTimes;
-  if (alertEnabled) data.alertEnabled = alertEnabled;
-  saveData(data);
-  res.json({ ok: true });
+app.post("/data", async (req, res) => {
+  try {
+    const data = await loadData();
+    const { members, chores, tasks, alertTimes, alertEnabled } = req.body;
+    if (members) data.members = members;
+    if (chores) {
+      // Preserve each existing chore's rotationIndex unless the incoming
+      // payload explicitly changes its eligible pool (in which case reset to 0
+      // so a newly restricted/expanded pool starts rotation cleanly).
+      const prevById = Object.fromEntries((data.chores || []).map(c => [c.id, c]));
+      data.chores = chores.map(c => {
+        const prev = prevById[c.id];
+        const samePool = prev && JSON.stringify(prev.eligibleMemberIds || []) === JSON.stringify(c.eligibleMemberIds || []);
+        return {
+          ...c,
+          rotationIndex: samePool ? (prev.rotationIndex || 0) : 0,
+        };
+      });
+    }
+    if (tasks) data.tasks = tasks;
+    if (alertTimes) data.alertTimes = alertTimes;
+    if (alertEnabled) data.alertEnabled = alertEnabled;
+    await saveData(data);
+    console.log(`Saved data: ${data.members.length} members, ${data.chores.length} chores.`);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /data failed:", e.message, e.stack);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Today's status — useful for the dashboard
-app.get("/status/today", (req, res) => {
-  const data = loadData();
+app.get("/status/today", async (req, res) => {
+  const data = await loadData();
   const today = new Date().toISOString().split("T")[0];
   const todayEntries = Object.entries(data.dailyLog)
     .filter(([k]) => k.startsWith(today))
@@ -295,7 +429,7 @@ app.get("/status/today", (req, res) => {
 // Test endpoint — sends a single test email
 app.post("/test-email", async (req, res) => {
   const { memberId } = req.body;
-  const data = loadData();
+  const data = await loadData();
   const member = data.members.find(m => m.id === memberId);
   if (!member?.email) return res.status(400).json({ error: "Member not found or no email set" });
   const chore = { name: "Test chore — it works! 🎉", category: "Test" };
@@ -372,7 +506,19 @@ app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISO
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Chorehouse backend running on port ${PORT}`);
-  scheduleCrons();
-});
+
+async function start() {
+  try {
+    await ensureSchema();
+    console.log("Database schema ready.");
+  } catch (e) {
+    console.error("FATAL: could not connect to database. Check DATABASE_URL.", e.message);
+    process.exit(1);
+  }
+  app.listen(PORT, async () => {
+    console.log(`Chorehouse backend running on port ${PORT}`);
+    await scheduleCrons();
+  });
+}
+
+start();
