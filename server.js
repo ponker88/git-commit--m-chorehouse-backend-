@@ -164,6 +164,11 @@ function generateSchedule(data) {
     members.forEach(m => { schedule[day][m.id] = null; });
   });
 
+  // Chores that couldn't be placed on a given day because everyone in their
+  // eligible pool already had a chore that day. Surfaced to the frontend so
+  // nothing silently disappears — you can see it and adjust the day/pool.
+  const unscheduled = []; // { choreId, choreName, day }
+
   // Track which non-weekly slots are filled per day so daily/2x chores
   // still avoid double-booking a member on the same day.
   function placeOnDay(day, chore, member) {
@@ -184,11 +189,13 @@ function generateSchedule(data) {
       const assignee = pool[idx];
       days.forEach(day => {
         if (!placeOnDay(day, chore, assignee)) {
-          // Slot taken (rare collision) — try next person in this chore's own pool.
+          // Slot taken — try next person in this chore's own pool who's free that day.
+          let placed = false;
           for (let offset = 1; offset < pool.length; offset++) {
             const candidate = pool[(idx + offset) % pool.length];
-            if (placeOnDay(day, chore, candidate)) break;
+            if (placeOnDay(day, chore, candidate)) { placed = true; break; }
           }
+          if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
         }
       });
       return;
@@ -208,13 +215,21 @@ function generateSchedule(data) {
     const primaryMember = pool[memberIndex];
     activeDays.forEach(day => {
       if (!placeOnDay(day, chore, primaryMember)) {
-        const other = pool.find(m => m.id !== primaryMember.id && !schedule[day][m.id]);
-        if (other) placeOnDay(day, chore, other);
+        const other = pool.find(m => !schedule[day][m.id]);
+        if (other) {
+          placeOnDay(day, chore, other);
+        } else {
+          unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
+        }
       }
     });
   });
 
-  return schedule;
+  if (unscheduled.length > 0) {
+    console.warn("Chores could not be scheduled (everyone eligible already booked that day):", unscheduled);
+  }
+
+  return { schedule, unscheduled };
 }
 
 // ── Email sending ──────────────────────────────────────────────────────────
@@ -291,7 +306,7 @@ async function runAlerts(alertIndex) {
 
   const today = new Date().toISOString().split("T")[0];
   const dayName = getTodayDayName();
-  const schedule = generateSchedule(data);
+  const { schedule } = generateSchedule(data);
 
   for (const member of members) {
     if (!member.email) continue;
@@ -373,7 +388,8 @@ app.get("/data", async (req, res) => {
     // so the displayed schedule always reflects the latest fair-rotation state.
     const advanced = advanceWeeklyRotationsIfNeeded(data);
     if (advanced) await saveData(data);
-    res.json({ ...data, schedule: generateSchedule(data) });
+    const { schedule, unscheduled } = generateSchedule(data);
+    res.json({ ...data, schedule, unscheduled });
   } catch (e) {
     console.error("GET /data failed:", e.message, e.stack);
     res.status(500).json({ error: e.message });
