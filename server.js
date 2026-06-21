@@ -204,8 +204,9 @@ function generateSchedule(data) {
       return;
     }
 
-    // Daily / 2x / etc — unchanged auto-rotating behavior, but now respects
-    // the chore's eligible pool (feature 2) instead of always using all members.
+    // Daily / 2x / etc — rotates through the eligible pool day by day, so a
+    // "daily" chore actually cycles between different people across the week
+    // instead of locking onto one person for all 7 days.
     const dpw = FREQ_DAYS[chore.frequency] ?? 1;
     let activeDays = [];
     if (dpw === 7) activeDays = [...DAYS];
@@ -214,9 +215,12 @@ function generateSchedule(data) {
     else if (dpw === 2) activeDays = [DAYS[0], DAYS[3]];
     else activeDays = [DAYS[weekOffset % 7]];
 
-    const memberIndex = (i + weekOffset) % pool.length;
-    const primaryMember = pool[memberIndex];
-    activeDays.forEach(day => {
+    activeDays.forEach((day, dayPos) => {
+      // Each day within the chore's active days advances to the next person
+      // in the pool, so e.g. a daily chore with 4 eligible people cycles
+      // through all 4 roughly twice a week instead of sticking to one person.
+      const memberIndex = (i + weekOffset + dayPos) % pool.length;
+      const primaryMember = pool[memberIndex];
       if (!placeOnDay(day, chore, primaryMember)) {
         const other = pool.find(m => !schedule[day][m.id]);
         if (other) {
