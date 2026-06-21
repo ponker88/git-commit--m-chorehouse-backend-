@@ -97,6 +97,9 @@ function getDefaultData() {
       { id: 8, name: "Wipe counters",      frequency: "daily",  category: "Kitchen",     eligibleMemberIds: [], rotationIndex: 0 },
     ],
     tasks: [],
+    // Active hourly-reminder tasks: { [taskId]: { task, member, done, token } }
+    // Persisted (not in-memory) so reminders survive server restarts.
+    taskReminders: {},
     // Map of "YYYY-MM-DD:memberId" → { choreId, done, token }
     dailyLog: {},
     // Tracks the last ISO week number we advanced rotation for, so we only
@@ -458,10 +461,7 @@ app.post("/test-email", async (req, res) => {
 });
 
 // Health check
-// ── Task notification routes ───────────────────────────────────────────────
-
-// taskReminders: { taskId: { task, member, done, nextSendTime } }
-const taskReminders = {};
+// Task notification routes ───────────────────────────────────────────────
 
 async function sendTaskEmail(member, task, token) {
   const doneUrl = (process.env.BACKEND_URL || "http://localhost:3001") + "/task-done/" + token;
@@ -480,7 +480,9 @@ app.post("/task-notify", async (req, res) => {
   try {
     const token = makeToken();
     await sendTaskEmail(member, task, token);
-    taskReminders[task.id] = { task, member, done: false, token };
+    const data = await loadData();
+    data.taskReminders[task.id] = { task, member, done: false, token };
+    await saveData(data);
     console.log("Task notification sent for: " + task.title + " -> " + member.name);
     res.json({ ok: true });
   } catch (e) {
@@ -489,33 +491,55 @@ app.post("/task-notify", async (req, res) => {
   }
 });
 
-app.post("/task-complete", (req, res) => {
-  const { taskId } = req.body;
-  if (taskReminders[taskId]) delete taskReminders[taskId];
-  res.json({ ok: true });
+app.post("/task-complete", async (req, res) => {
+  try {
+    const { taskId } = req.body;
+    const data = await loadData();
+    if (data.taskReminders[taskId]) {
+      delete data.taskReminders[taskId];
+      await saveData(data);
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /task-complete failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 cron.schedule("0 * * * *", async () => {
   console.log("Hourly task reminder check at " + new Date().toISOString());
-  for (const id of Object.keys(taskReminders)) {
-    const entry = taskReminders[id];
-    if (!entry || entry.done) { delete taskReminders[id]; continue; }
-    try {
-      await sendTaskEmail(entry.member, entry.task, entry.token || makeToken());
-      console.log("Hourly reminder sent: " + entry.task.title + " -> " + entry.member.name);
-    } catch (e) {
-      console.error("Hourly reminder failed:", e.message);
+  try {
+    const data = await loadData();
+    let changed = false;
+    for (const id of Object.keys(data.taskReminders)) {
+      const entry = data.taskReminders[id];
+      if (!entry || entry.done) { delete data.taskReminders[id]; changed = true; continue; }
+      try {
+        await sendTaskEmail(entry.member, entry.task, entry.token || makeToken());
+        console.log("Hourly reminder sent: " + entry.task.title + " -> " + entry.member.name);
+      } catch (e) {
+        console.error("Hourly reminder failed:", e.message);
+      }
     }
+    if (changed) await saveData(data);
+  } catch (e) {
+    console.error("Hourly task reminder check failed:", e.message);
   }
 }, { timezone: process.env.TZ || "America/Los_Angeles" });
 
-app.get("/task-done/:token", (req, res) => {
+app.get("/task-done/:token", async (req, res) => {
   const token = req.params.token;
-  const entry = Object.values(taskReminders).find(function(e) { return e.token === token; });
-  if (!entry) return res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>!</div><div style='color:#F1948A;margin-top:16px'>Link expired or already done.</div></div></body>");
-  entry.done = true;
-  delete taskReminders[entry.task.id];
-  res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>:)</div><div style='color:#82E0AA;margin-top:16px;font-size:20px'>Task complete! Great work.</div></div></body>");
+  try {
+    const data = await loadData();
+    const entry = Object.values(data.taskReminders).find((e) => e.token === token);
+    if (!entry) return res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>!</div><div style='color:#F1948A;margin-top:16px'>Link expired or already done.</div></div></body>");
+    delete data.taskReminders[entry.task.id];
+    await saveData(data);
+    res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>:)</div><div style='color:#82E0AA;margin-top:16px;font-size:20px'>Task complete! Great work.</div></div></body>");
+  } catch (e) {
+    console.error("GET /task-done failed:", e.message);
+    res.status(500).send("Something went wrong.");
+  }
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
