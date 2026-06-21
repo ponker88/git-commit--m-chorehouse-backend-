@@ -351,10 +351,21 @@ function parseCron(timeStr) {
   return `${m} ${h} * * *`;
 }
 
+// Keep references to the currently-registered alert cron jobs so we can
+// cancel and rebuild them whenever alertTimes changes via Settings, instead
+// of only ever scheduling once at server startup (which silently ignored
+// any later time changes — the original bug).
+let activeAlertCronJobs = [];
+
 async function scheduleCrons() {
+  // Cancel any previously-scheduled alert jobs first.
+  activeAlertCronJobs.forEach((job) => job.stop());
+  activeAlertCronJobs = [];
+
   const data = await loadData();
   data.alertTimes.forEach((time, i) => {
-    cron.schedule(parseCron(time), () => runAlerts(i), { timezone: process.env.TZ || "America/Los_Angeles" });
+    const job = cron.schedule(parseCron(time), () => runAlerts(i), { timezone: process.env.TZ || "America/Los_Angeles" });
+    activeAlertCronJobs.push(job);
     console.log(`Scheduled alert ${i + 1} at ${time}`);
   });
 }
@@ -427,6 +438,13 @@ app.post("/data", async (req, res) => {
     if (alertEnabled) data.alertEnabled = alertEnabled;
     await saveData(data);
     console.log(`Saved data: ${data.members.length} members, ${data.chores.length} chores.`);
+
+    // If alert times changed, rebuild the cron schedule immediately instead
+    // of waiting for the next server restart to pick up the new times.
+    if (alertTimes) {
+      await scheduleCrons();
+    }
+
     res.json({ ok: true });
   } catch (e) {
     console.error("POST /data failed:", e.message, e.stack);
