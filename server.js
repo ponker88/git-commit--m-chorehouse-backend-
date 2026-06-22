@@ -324,7 +324,8 @@ async function runAlerts(alertIndex) {
     const existing = dailyLog[logKey];
 
     // Already marked done — skip all reminders
-    if (existing?.done) continue;
+    console.log(`Alert ${alertIndex + 1} check: ${member.name} logKey=${logKey} existing=${JSON.stringify(existing)}`);
+    if (existing?.done) { console.log(`-> Skipping ${member.name} (done)`); continue; }
 
     if (alertIndex === 0) {
       // Morning: always send and create log entry
@@ -377,13 +378,18 @@ app.get("/complete/:token", async (req, res) => {
   const { token } = req.params;
   const data = await loadData();
   const entry = Object.entries(data.dailyLog).find(([, v]) => v.token === token);
-  if (!entry) return res.send(doneHtml("This link has expired or is invalid.", false));
+  if (!entry) {
+    console.log(`Complete: token not found in dailyLog. Known tokens: ${Object.values(data.dailyLog).map(v=>v.token).join(', ')}`);
+    return res.send(doneHtml("This link has expired or is invalid.", false));
+  }
 
   const [key, val] = entry;
+  console.log(`Complete: found key=${key}, already done=${val.done}`);
   if (val.done) return res.send(doneHtml("Already marked as done — nice work! ✓", true));
 
   data.dailyLog[key].done = true;
   await saveData(data);
+  console.log(`Complete: saved done=true for key=${key}`);
   res.send(doneHtml("Chore marked as complete! Great work 🎉", true));
 });
 
