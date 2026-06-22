@@ -1,4 +1,4 @@
-// ============================================================
+ // ============================================================
 //  Chorehouse Backend  –  server.js
 //  Node.js + Express + Resend + node-cron
 // ============================================================
@@ -304,6 +304,9 @@ async function sendReminderEmail(member, chore, token) {
 // ── Core daily job ─────────────────────────────────────────────────────────
 async function runAlerts(alertIndex) {
   const data = await loadData();
+  // Guard: fields may be missing from rows initialized before they were added
+  if (!data.dailyLog) data.dailyLog = {};
+  if (!data.taskReminders) data.taskReminders = {};
   const { members, alertTimes, alertEnabled, dailyLog } = data;
   if (!alertEnabled[alertIndex]) return;
 
@@ -377,6 +380,7 @@ async function scheduleCrons() {
 app.get("/complete/:token", async (req, res) => {
   const { token } = req.params;
   const data = await loadData();
+  if (!data.dailyLog) data.dailyLog = {};
   const entry = Object.entries(data.dailyLog).find(([, v]) => v.token === token);
   if (!entry) {
     console.log(`Complete: token not found in dailyLog. Known tokens: ${Object.values(data.dailyLog).map(v=>v.token).join(', ')}`);
@@ -461,6 +465,7 @@ app.post("/data", async (req, res) => {
 // Today's status — useful for the dashboard
 app.get("/status/today", async (req, res) => {
   const data = await loadData();
+  if (!data.dailyLog) data.dailyLog = {};
   const today = new Date().toISOString().split("T")[0];
   const todayEntries = Object.entries(data.dailyLog)
     .filter(([k]) => k.startsWith(today))
@@ -509,6 +514,7 @@ app.post("/task-notify", async (req, res) => {
     const token = makeToken();
     await sendTaskEmail(member, task, token);
     const data = await loadData();
+    if (!data.taskReminders) data.taskReminders = {};
     data.taskReminders[task.id] = { task, member, done: false, token };
     await saveData(data);
     console.log("Task notification sent for: " + task.title + " -> " + member.name);
@@ -523,6 +529,7 @@ app.post("/task-complete", async (req, res) => {
   try {
     const { taskId } = req.body;
     const data = await loadData();
+    if (!data.taskReminders) data.taskReminders = {};
     if (data.taskReminders[taskId]) {
       delete data.taskReminders[taskId];
       await saveData(data);
@@ -538,6 +545,8 @@ cron.schedule("0 * * * *", async () => {
   console.log("Hourly task reminder check at " + new Date().toISOString());
   try {
     const data = await loadData();
+    // Guard: taskReminders may be missing from rows initialized before this field was added
+    if (!data.taskReminders) data.taskReminders = {};
     let changed = false;
     for (const id of Object.keys(data.taskReminders)) {
       const entry = data.taskReminders[id];
@@ -559,6 +568,7 @@ app.get("/task-done/:token", async (req, res) => {
   const token = req.params.token;
   try {
     const data = await loadData();
+    if (!data.taskReminders) data.taskReminders = {};
     const entry = Object.values(data.taskReminders).find((e) => e.token === token);
     if (!entry) return res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>!</div><div style='color:#F1948A;margin-top:16px'>Link expired or already done.</div></div></body>");
     delete data.taskReminders[entry.task.id];
