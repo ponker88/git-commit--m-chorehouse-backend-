@@ -112,10 +112,19 @@ function getDefaultData() {
 
 // ── Schedule logic (mirrors the frontend) ─────────────────────────────────
 const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-const FREQ_DAYS = { daily: 7, "5x": 5, "3x": 3, "2x": 2, weekly: 1 };
+
+// How many days per week each high-frequency chore is active
+const FREQ_DAYS = { daily: 7, "5x": 5, "3x": 3, "2x": 2 };
+
+// How many weeks between each occurrence for low-frequency chores
+const FREQ_WEEKS = { weekly: 1, "2weeks": 2, monthly: 4, quarterly: 12 };
+
+// Whether a frequency is "low" (fixed-day, rotation-tracked) vs "high" (within-week)
+function isLowFreq(frequency) {
+  return frequency in FREQ_WEEKS;
+}
 
 function getWeekOffset() {
-  // Week offset = number of weeks since a fixed epoch (2024-01-01)
   const epoch = new Date("2024-01-01");
   const now = new Date();
   return Math.floor((now - epoch) / (7 * 24 * 60 * 60 * 1000));
@@ -126,36 +135,53 @@ function getTodayDayName() {
   return DAYS[d === 0 ? 6 : d - 1];
 }
 
-// Returns the pool of members eligible for a chore (falls back to everyone
-// if the chore has no restriction set, or the restriction is empty/invalid).
 function eligiblePoolFor(chore, members) {
   const ids = chore.eligibleMemberIds;
   if (!ids || ids.length === 0) return members;
   const pool = members.filter(m => ids.includes(m.id));
-  return pool.length > 0 ? pool : members; // safety fallback
+  return pool.length > 0 ? pool : members;
 }
 
-// Advances each weekly, fixed-day chore's rotationIndex exactly once per
-// calendar week (so the *next* week's assignee moves forward by one within
-// that chore's own eligible pool — giving a true even round-robin even when
-// pool sizes differ chore-to-chore, e.g. a 2-person chore cycles every 2
-// weeks while a 4-person chore cycles every 4).
-function advanceWeeklyRotationsIfNeeded(data) {
+// Advances each low-frequency chore's rotationIndex based on its own cadence.
+// Each chore tracks its own lastAdvancedWeek so a monthly chore only advances
+// every 4 weeks, a quarterly chore every 12 weeks, etc. — independently of
+// what other chores are doing.
+function advanceRotationsIfNeeded(data) {
   const weekOffset = getWeekOffset();
-  if (data.lastRotationWeek === weekOffset) return false; // already advanced this week
-  const isFirstRun = data.lastRotationWeek === null;
+  let changed = false;
   data.chores.forEach(chore => {
-    if (chore.frequency !== "weekly") return;
+    if (!isLowFreq(chore.frequency)) return;
+    const cadence = FREQ_WEEKS[chore.frequency] || 1;
     const pool = eligiblePoolFor(chore, data.members);
-    if (!isFirstRun) {
-      chore.rotationIndex = ((chore.rotationIndex || 0) + 1) % pool.length;
-    } else {
-      // First time the server has ever run rotation: keep index 0, just clamp to pool size.
+    const lastAdvanced = chore.lastAdvancedWeek ?? null;
+
+    if (lastAdvanced === null) {
+      // First ever run for this chore — clamp index to pool size, don't advance.
       chore.rotationIndex = (chore.rotationIndex || 0) % pool.length;
+      chore.lastAdvancedWeek = weekOffset;
+      changed = true;
+    } else if (weekOffset >= lastAdvanced + cadence) {
+      // Enough weeks have passed for this chore's cadence — advance it.
+      chore.rotationIndex = ((chore.rotationIndex || 0) + 1) % pool.length;
+      chore.lastAdvancedWeek = weekOffset;
+      changed = true;
     }
   });
-  data.lastRotationWeek = weekOffset;
-  return true;
+  // Keep the legacy lastRotationWeek in sync for backwards compatibility.
+  if (changed) data.lastRotationWeek = weekOffset;
+  return changed;
+}
+
+// Returns true only in the first week of each cadence window.
+// e.g. a 2-week chore is due week 0, 2, 4, 6... (not every week)
+// a monthly chore (4-week cadence) is due week 0, 4, 8, 12...
+function isDueThisWeek(chore) {
+  if (!isLowFreq(chore.frequency)) return true; // daily/2x always active
+  if (chore.frequency === "weekly") return true; // weekly always due
+  const weekOffset = getWeekOffset();
+  const lastAdvanced = chore.lastAdvancedWeek ?? weekOffset;
+  // Only due in the exact week it was last advanced (first week of its window)
+  return weekOffset === lastAdvanced;
 }
 
 function generateSchedule(data) {
@@ -185,14 +211,16 @@ function generateSchedule(data) {
   chores.forEach((chore, i) => {
     const pool = eligiblePoolFor(chore, members);
 
-    if (chore.frequency === "weekly") {
-      // Feature 1 + 2 + 3: fixed day(s), restricted pool, fair rotation.
+    if (isLowFreq(chore.frequency)) {
+      // Fixed-day chores (weekly, 2weeks, monthly, quarterly).
+      // Only appear in the schedule during the week they're due.
+      if (!isDueThisWeek(chore)) return;
+
       const days = (chore.fixedDays && chore.fixedDays.length > 0) ? chore.fixedDays : [DAYS[weekOffset % 7]];
       const idx = (chore.rotationIndex || 0) % pool.length;
       const assignee = pool[idx];
       days.forEach(day => {
         if (!placeOnDay(day, chore, assignee)) {
-          // Slot taken — try next person in this chore's own pool who's free that day.
           let placed = false;
           for (let offset = 1; offset < pool.length; offset++) {
             const candidate = pool[(idx + offset) % pool.length];
@@ -311,7 +339,7 @@ async function runAlerts(alertIndex) {
   if (!alertEnabled[alertIndex]) return;
 
   // Feature 3: advance each weekly chore's fair-rotation cursor once per week.
-  const advanced = advanceWeeklyRotationsIfNeeded(data);
+  const advanced = advanceRotationsIfNeeded(data);
   if (advanced) await saveData(data);
 
   const today = new Date().toISOString().split("T")[0];
@@ -414,7 +442,7 @@ app.get("/data", async (req, res) => {
     const data = await loadData();
     // Make sure rotation is current whenever the frontend asks for data too,
     // so the displayed schedule always reflects the latest fair-rotation state.
-    const advanced = advanceWeeklyRotationsIfNeeded(data);
+    const advanced = advanceRotationsIfNeeded(data);
     if (advanced) await saveData(data);
     const { schedule, unscheduled } = generateSchedule(data);
     res.json({ ...data, schedule, unscheduled });
@@ -437,9 +465,13 @@ app.post("/data", async (req, res) => {
       data.chores = chores.map(c => {
         const prev = prevById[c.id];
         const samePool = prev && JSON.stringify(prev.eligibleMemberIds || []) === JSON.stringify(c.eligibleMemberIds || []);
+        const sameFreq = prev && prev.frequency === c.frequency;
         return {
           ...c,
+          // Reset rotation if pool changed; preserve if same pool/frequency.
           rotationIndex: samePool ? (prev.rotationIndex || 0) : 0,
+          // Reset lastAdvancedWeek if frequency changed so new cadence starts fresh.
+          lastAdvancedWeek: (samePool && sameFreq) ? (prev.lastAdvancedWeek ?? null) : null,
         };
       });
     }
