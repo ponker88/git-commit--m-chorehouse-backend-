@@ -64,7 +64,30 @@ async function loadData() {
   }
   // pg auto-parses JSONB columns back into JS objects on read, so rows[0].data
   // is already a JS object here — no JSON.parse needed on this side.
-  return rows[0].data;
+  const data = rows[0].data;
+
+  // Defensive normalization: these fields may be missing or null in rows
+  // written before they were added, or if a JSONB round-trip coerces them.
+  if (!data.taskReminders || typeof data.taskReminders !== "object" || Array.isArray(data.taskReminders)) {
+    data.taskReminders = {};
+  }
+  if (!data.dailyLog || typeof data.dailyLog !== "object" || Array.isArray(data.dailyLog)) {
+    data.dailyLog = {};
+  }
+  if (!data.alertTimes) data.alertTimes = ["08:00", "12:00", "17:00"];
+  if (!data.alertEnabled) data.alertEnabled = [true, true, true];
+  if (!Array.isArray(data.tasks)) data.tasks = [];
+
+  // Ensure all taskReminder keys are strings (large integer IDs can get
+  // mangled during JSONB serialisation if stored as numeric keys).
+  const reminders = data.taskReminders;
+  const stringKeyedReminders = {};
+  for (const k of Object.keys(reminders)) {
+    stringKeyedReminders[String(k)] = reminders[k];
+  }
+  data.taskReminders = stringKeyedReminders;
+
+  return data;
 }
 
 async function saveData(data) {
@@ -332,9 +355,7 @@ async function sendReminderEmail(member, chore, token) {
 // ── Core daily job ─────────────────────────────────────────────────────────
 async function runAlerts(alertIndex) {
   const data = await loadData();
-  // Guard: fields may be missing from rows initialized before they were added
-  if (!data.dailyLog) data.dailyLog = {};
-  if (!data.taskReminders) data.taskReminders = {};
+  // loadData() now normalises dailyLog and taskReminders — no extra guards needed here.
   const { members, alertTimes, alertEnabled, dailyLog } = data;
   if (!alertEnabled[alertIndex]) return;
 
@@ -546,8 +567,9 @@ app.post("/task-notify", async (req, res) => {
     const token = makeToken();
     await sendTaskEmail(member, task, token);
     const data = await loadData();
-    if (!data.taskReminders) data.taskReminders = {};
-    data.taskReminders[task.id] = { task, member, done: false, token };
+    // Always store taskReminder keys as strings — large integer IDs stored as
+    // numeric JSONB keys can be misread on the next load.
+    data.taskReminders[String(task.id)] = { task, member, done: false, token };
     await saveData(data);
     console.log("Task notification sent for: " + task.title + " -> " + member.name);
     res.json({ ok: true });
@@ -561,9 +583,10 @@ app.post("/task-complete", async (req, res) => {
   try {
     const { taskId } = req.body;
     const data = await loadData();
-    if (!data.taskReminders) data.taskReminders = {};
-    if (data.taskReminders[taskId]) {
-      delete data.taskReminders[taskId];
+    // taskReminder keys are always strings; coerce incoming taskId to match.
+    const key = String(taskId);
+    if (data.taskReminders[key]) {
+      delete data.taskReminders[key];
       await saveData(data);
     }
     res.json({ ok: true });
@@ -577,11 +600,11 @@ cron.schedule("0 * * * *", async () => {
   console.log("Hourly task reminder check at " + new Date().toISOString());
   try {
     const data = await loadData();
-    // Guard: taskReminders may be missing from rows initialized before this field was added
-    if (!data.taskReminders) data.taskReminders = {};
+    // loadData() now guarantees taskReminders is a plain object, but guard anyway.
+    const reminders = data.taskReminders || {};
     let changed = false;
-    for (const id of Object.keys(data.taskReminders)) {
-      const entry = data.taskReminders[id];
+    for (const id of Object.keys(reminders)) {
+      const entry = reminders[id];
       if (!entry || entry.done) { delete data.taskReminders[id]; changed = true; continue; }
       try {
         await sendTaskEmail(entry.member, entry.task, entry.token || makeToken());
@@ -600,10 +623,10 @@ app.get("/task-done/:token", async (req, res) => {
   const token = req.params.token;
   try {
     const data = await loadData();
-    if (!data.taskReminders) data.taskReminders = {};
-    const entry = Object.values(data.taskReminders).find((e) => e.token === token);
+    // loadData() guarantees taskReminders is a plain object.
+    const entry = Object.values(data.taskReminders).find((e) => e && e.token === token);
     if (!entry) return res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>!</div><div style='color:#F1948A;margin-top:16px'>Link expired or already done.</div></div></body>");
-    delete data.taskReminders[entry.task.id];
+    delete data.taskReminders[String(entry.task.id)];
     await saveData(data);
     res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>:)</div><div style='color:#82E0AA;margin-top:16px;font-size:20px'>Task complete! Great work.</div></div></body>");
   } catch (e) {
