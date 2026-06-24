@@ -662,7 +662,12 @@ app.get("/task-done/:token", async (req, res) => {
     // loadData() guarantees taskReminders is a plain object.
     const entry = Object.values(data.taskReminders).find((e) => e && e.token === token);
     if (!entry) return res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>!</div><div style='color:#F1948A;margin-top:16px'>Link expired or already done.</div></div></body>");
+    // Stop reminders and mark the task as done in data.tasks so it shows
+    // as completed in the frontend app when someone uses the email link.
     delete data.taskReminders[String(entry.task.id)];
+    data.tasks = (data.tasks || []).map((t) =>
+      String(t.id) === String(entry.task.id) ? { ...t, done: true } : t
+    );
     await saveData(data);
     res.send("<body style='font-family:monospace;background:#0F0E0C;color:#E8E2D9;display:flex;align-items:center;justify-content:center;min-height:100vh;'><div style='text-align:center'><div style='font-size:48px'>:)</div><div style='color:#82E0AA;margin-top:16px;font-size:20px'>Task complete! Great work.</div></div></body>");
   } catch (e) {
