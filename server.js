@@ -239,18 +239,35 @@ function generateSchedule(data) {
       // Only appear in the schedule during the week they're due.
       if (!isDueThisWeek(chore)) return;
 
-      const days = (chore.fixedDays && chore.fixedDays.length > 0) ? chore.fixedDays : [DAYS[weekOffset % 7]];
+      const preferredDays = (chore.fixedDays && chore.fixedDays.length > 0) ? chore.fixedDays : [DAYS[weekOffset % 7]];
       const idx = (chore.rotationIndex || 0) % pool.length;
       const assignee = pool[idx];
-      days.forEach(day => {
-        if (!placeOnDay(day, chore, assignee)) {
-          let placed = false;
+
+      preferredDays.forEach(preferredDay => {
+        // Try the preferred day first (primary assignee, then others in pool).
+        let placed = placeOnDay(preferredDay, chore, assignee);
+        if (!placed) {
           for (let offset = 1; offset < pool.length; offset++) {
             const candidate = pool[(idx + offset) % pool.length];
-            if (placeOnDay(day, chore, candidate)) { placed = true; break; }
+            if (placeOnDay(preferredDay, chore, candidate)) { placed = true; break; }
           }
-          if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
         }
+        // Everyone in the pool is booked on the preferred day — spill to the
+        // next available day in the week where at least one pool member is free.
+        if (!placed) {
+          const startIdx = DAYS.indexOf(preferredDay);
+          for (let d = 1; d < DAYS.length; d++) {
+            const altDay = DAYS[(startIdx + d) % DAYS.length];
+            // Try primary assignee first, then rest of pool.
+            if (placeOnDay(altDay, chore, assignee)) { placed = true; break; }
+            for (let offset = 1; offset < pool.length; offset++) {
+              const candidate = pool[(idx + offset) % pool.length];
+              if (placeOnDay(altDay, chore, candidate)) { placed = true; break; }
+            }
+            if (placed) break;
+          }
+        }
+        if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day: preferredDay });
       });
       return;
     }
@@ -272,14 +289,25 @@ function generateSchedule(data) {
       // through all 4 roughly twice a week instead of sticking to one person.
       const memberIndex = (i + weekOffset + dayPos) % pool.length;
       const primaryMember = pool[memberIndex];
-      if (!placeOnDay(day, chore, primaryMember)) {
+      let placed = placeOnDay(day, chore, primaryMember);
+      if (!placed) {
+        // Try other pool members on the same day.
         const other = pool.find(m => !schedule[day][m.id]);
         if (other) {
-          placeOnDay(day, chore, other);
-        } else {
-          unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
+          placed = placeOnDay(day, chore, other);
         }
       }
+      // Everyone in pool is booked on this active day — spill to a different
+      // day that isn't already one of this chore's active days.
+      if (!placed) {
+        const spillDays = DAYS.filter(d => !activeDays.includes(d));
+        for (const altDay of spillDays) {
+          if (placeOnDay(altDay, chore, primaryMember)) { placed = true; break; }
+          const other = pool.find(m => !schedule[altDay][m.id]);
+          if (other && placeOnDay(altDay, chore, other)) { placed = true; break; }
+        }
+      }
+      if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
     });
   });
 
@@ -585,10 +613,16 @@ app.post("/task-complete", async (req, res) => {
     const data = await loadData();
     // taskReminder keys are always strings; coerce incoming taskId to match.
     const key = String(taskId);
+    let changed = false;
     if (data.taskReminders[key]) {
       delete data.taskReminders[key];
-      await saveData(data);
+      changed = true;
     }
+    // Also remove from data.tasks so it doesn't reappear after a page refresh.
+    const before = (data.tasks || []).length;
+    data.tasks = (data.tasks || []).filter((t) => String(t.id) !== key);
+    if (data.tasks.length !== before) changed = true;
+    if (changed) await saveData(data);
     res.json({ ok: true });
   } catch (e) {
     console.error("POST /task-complete failed:", e.message);
