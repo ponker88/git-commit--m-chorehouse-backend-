@@ -614,14 +614,16 @@ app.post("/task-complete", async (req, res) => {
     // taskReminder keys are always strings; coerce incoming taskId to match.
     const key = String(taskId);
     let changed = false;
+    // Stop hourly reminders for this task.
     if (data.taskReminders[key]) {
       delete data.taskReminders[key];
       changed = true;
     }
-    // Also remove from data.tasks so it doesn't reappear after a page refresh.
-    const before = (data.tasks || []).length;
-    data.tasks = (data.tasks || []).filter((t) => String(t.id) !== key);
-    if (data.tasks.length !== before) changed = true;
+    // Mark the task as done in data.tasks so it persists across refreshes.
+    data.tasks = (data.tasks || []).map((t) => {
+      if (String(t.id) === key) { changed = true; return { ...t, done: true }; }
+      return t;
+    });
     if (changed) await saveData(data);
     res.json({ ok: true });
   } catch (e) {
