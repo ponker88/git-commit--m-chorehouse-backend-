@@ -286,6 +286,20 @@ function generateSchedule(data) {
     // Track which days this chore has already been placed on (including spills)
     // so we never put the same chore on the same day twice.
     const chorePlacedDays = new Set();
+    // Ideal minimum gap between occurrences (e.g. 7/3 ≈ 2 days for 3x/week).
+    const minGap = Math.floor(7 / (FREQ_DAYS[chore.frequency] ?? 1));
+
+    // Returns true if a candidate day is far enough from all already-placed days.
+    function isWellSpaced(candidateDay) {
+      if (chorePlacedDays.size === 0) return true;
+      const ci = DAYS.indexOf(candidateDay);
+      for (const placed of chorePlacedDays) {
+        const pi = DAYS.indexOf(placed);
+        const gap = Math.min(Math.abs(ci - pi), 7 - Math.abs(ci - pi));
+        if (gap < minGap) return false;
+      }
+      return true;
+    }
 
     activeDays.forEach((day, dayPos) => {
       // Each day within the chore's active days advances to the next person
@@ -304,11 +318,14 @@ function generateSchedule(data) {
         }
       }
       // Everyone in pool is booked on this active day — spill to a different
-      // day that isn't already one of this chore's active days AND hasn't
-      // already been used by a spill for this same chore.
+      // day that isn't already used by this chore AND is well-spaced from
+      // other occurrences. Try well-spaced days first, fall back to any free
+      // day if nothing well-spaced is available.
       if (!placed) {
-        const spillDays = DAYS.filter(d => !activeDays.includes(d) && !chorePlacedDays.has(d));
-        for (const altDay of spillDays) {
+        const freeDays = DAYS.filter(d => !activeDays.includes(d) && !chorePlacedDays.has(d));
+        const spacedDays = freeDays.filter(d => isWellSpaced(d));
+        const candidates = spacedDays.length > 0 ? spacedDays : freeDays;
+        for (const altDay of candidates) {
           if (placeOnDay(altDay, chore, primaryMember)) { placed = true; chorePlacedDays.add(altDay); break; }
           const other = pool.find(m => !schedule[altDay][m.id]);
           if (other && placeOnDay(altDay, chore, other)) { placed = true; chorePlacedDays.add(altDay); break; }
