@@ -272,67 +272,86 @@ function generateSchedule(data) {
       return;
     }
 
-    // Daily / 2x / etc — rotates through the eligible pool day by day, so a
-    // "daily" chore actually cycles between different people across the week
-    // instead of locking onto one person for all 7 days.
+    // Daily / 2x / 3x / 5x chores.
     const dpw = FREQ_DAYS[chore.frequency] ?? 1;
-    let activeDays = [];
-    if (dpw === 7) activeDays = [...DAYS];
-    else if (dpw === 5) activeDays = DAYS.slice(0, 5);
-    else if (dpw === 3) activeDays = [DAYS[0], DAYS[2], DAYS[4]];
-    else if (dpw === 2) activeDays = [DAYS[0], DAYS[3]];
-    else activeDays = [DAYS[weekOffset % 7]];
 
-    // Track which days this chore has already been placed on (including spills)
-    // so we never put the same chore on the same day twice.
-    const chorePlacedDays = new Set();
-    // Ideal minimum gap between occurrences (e.g. 7/3 ≈ 2 days for 3x/week).
-    const minGap = Math.floor(7 / (FREQ_DAYS[chore.frequency] ?? 1));
-
-    // Returns true if a candidate day is far enough from all already-placed days.
-    function isWellSpaced(candidateDay) {
-      if (chorePlacedDays.size === 0) return true;
-      const ci = DAYS.indexOf(candidateDay);
-      for (const placed of chorePlacedDays) {
-        const pi = DAYS.indexOf(placed);
-        const gap = Math.min(Math.abs(ci - pi), 7 - Math.abs(ci - pi));
-        if (gap < minGap) return false;
-      }
-      return true;
+    // If the user picked specific days for this chore (fixedDays set on a
+    // high-freq chore), treat each day as its own independent rotation slot
+    // so a different person is assigned to each day and nobody does it twice
+    // in the same week.
+    if ((chore.fixedDays && chore.fixedDays.length > 0) && dpw < 7) {
+      const days = chore.fixedDays;
+      days.forEach((day, dayPos) => {
+        // Each day slot uses a different offset into the pool so the same
+        // person doesn't get assigned every slot. weekOffset shifts the
+        // whole pattern forward by one person each week.
+        const memberIndex = (weekOffset + dayPos) % pool.length;
+        const primaryMember = pool[memberIndex];
+        if (!placeOnDay(day, chore, primaryMember)) {
+          // Primary is booked — try the next person in pool who isn't
+          // already assigned to a different slot of THIS chore today.
+          const alreadyUsed = days
+            .slice(0, dayPos)
+            .map((d, pos) => pool[(weekOffset + pos) % pool.length]);
+          const fallback = pool.find(m =>
+            m.id !== primaryMember.id &&
+            !alreadyUsed.find(u => u.id === m.id) &&
+            !schedule[day][m.id]
+          );
+          if (fallback) placeOnDay(day, chore, fallback);
+          else {
+            // Last resort: any free person on that day
+            const anyone = pool.find(m => !schedule[day][m.id]);
+            if (anyone) placeOnDay(day, chore, anyone);
+            else unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
+          }
+        }
+      });
+      return;
     }
 
-    activeDays.forEach((day, dayPos) => {
-      // Each day within the chore's active days advances to the next person
-      // in the pool, so e.g. a daily chore with 4 eligible people cycles
-      // through all 4 roughly twice a week instead of sticking to one person.
-      const memberIndex = (i + weekOffset + dayPos) % pool.length;
-      const primaryMember = pool[memberIndex];
-      let placed = placeOnDay(day, chore, primaryMember);
-      if (placed) { chorePlacedDays.add(day); }
-      if (!placed) {
-        // Try other pool members on the same day.
-        const other = pool.find(m => !schedule[day][m.id]);
-        if (other) {
-          placed = placeOnDay(day, chore, other);
-          if (placed) chorePlacedDays.add(day);
+    // No fixed days — daily just assigns straight through.
+    if (dpw === 7) {
+      DAYS.forEach((day, dayPos) => {
+        const memberIndex = (i + weekOffset + dayPos) % pool.length;
+        const primaryMember = pool[memberIndex];
+        if (!placeOnDay(day, chore, primaryMember)) {
+          const other = pool.find(m => !schedule[day][m.id]);
+          if (other) placeOnDay(day, chore, other);
+          else unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
         }
-      }
-      // Everyone in pool is booked on this active day — spill to a different
-      // day that isn't already used by this chore AND is well-spaced from
-      // other occurrences. Try well-spaced days first, fall back to any free
-      // day if nothing well-spaced is available.
-      if (!placed) {
-        const freeDays = DAYS.filter(d => !activeDays.includes(d) && !chorePlacedDays.has(d));
-        const spacedDays = freeDays.filter(d => isWellSpaced(d));
-        const candidates = spacedDays.length > 0 ? spacedDays : freeDays;
-        for (const altDay of candidates) {
-          if (placeOnDay(altDay, chore, primaryMember)) { placed = true; chorePlacedDays.add(altDay); break; }
-          const other = pool.find(m => !schedule[altDay][m.id]);
-          if (other && placeOnDay(altDay, chore, other)) { placed = true; chorePlacedDays.add(altDay); break; }
+      });
+    } else {
+      // For 2x, 3x, 5x without fixed days: pick best-spaced days greedily.
+      const chosenDays = [];
+      const startOffset = (i + weekOffset) % 7;
+      for (let pick = 0; pick < dpw; pick++) {
+        let bestDay = null, bestScore = -1;
+        for (let d = 0; d < 7; d++) {
+          const day = DAYS[(startOffset + d) % 7];
+          if (chosenDays.includes(day)) continue;
+          let minGap = 7;
+          const di = DAYS.indexOf(day);
+          for (const chosen of chosenDays) {
+            const ci = DAYS.indexOf(chosen);
+            const gap = Math.min(Math.abs(di - ci), 7 - Math.abs(di - ci));
+            if (gap < minGap) minGap = gap;
+          }
+          if (minGap > bestScore) { bestScore = minGap; bestDay = day; }
         }
+        if (bestDay) chosenDays.push(bestDay);
       }
-      if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
-    });
+      chosenDays.sort((a, b) => DAYS.indexOf(a) - DAYS.indexOf(b));
+      chosenDays.forEach((day, dayPos) => {
+        const memberIndex = (i + weekOffset + dayPos) % pool.length;
+        const primaryMember = pool[memberIndex];
+        if (!placeOnDay(day, chore, primaryMember)) {
+          const other = pool.find(m => !schedule[day][m.id]);
+          if (other) placeOnDay(day, chore, other);
+          else unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
+        }
+      });
+    }
   });
 
   if (unscheduled.length > 0) {
