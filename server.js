@@ -283,6 +283,10 @@ function generateSchedule(data) {
     else if (dpw === 2) activeDays = [DAYS[0], DAYS[3]];
     else activeDays = [DAYS[weekOffset % 7]];
 
+    // Track which days this chore has already been placed on (including spills)
+    // so we never put the same chore on the same day twice.
+    const chorePlacedDays = new Set();
+
     activeDays.forEach((day, dayPos) => {
       // Each day within the chore's active days advances to the next person
       // in the pool, so e.g. a daily chore with 4 eligible people cycles
@@ -290,21 +294,24 @@ function generateSchedule(data) {
       const memberIndex = (i + weekOffset + dayPos) % pool.length;
       const primaryMember = pool[memberIndex];
       let placed = placeOnDay(day, chore, primaryMember);
+      if (placed) { chorePlacedDays.add(day); }
       if (!placed) {
         // Try other pool members on the same day.
         const other = pool.find(m => !schedule[day][m.id]);
         if (other) {
           placed = placeOnDay(day, chore, other);
+          if (placed) chorePlacedDays.add(day);
         }
       }
       // Everyone in pool is booked on this active day — spill to a different
-      // day that isn't already one of this chore's active days.
+      // day that isn't already one of this chore's active days AND hasn't
+      // already been used by a spill for this same chore.
       if (!placed) {
-        const spillDays = DAYS.filter(d => !activeDays.includes(d));
+        const spillDays = DAYS.filter(d => !activeDays.includes(d) && !chorePlacedDays.has(d));
         for (const altDay of spillDays) {
-          if (placeOnDay(altDay, chore, primaryMember)) { placed = true; break; }
+          if (placeOnDay(altDay, chore, primaryMember)) { placed = true; chorePlacedDays.add(altDay); break; }
           const other = pool.find(m => !schedule[altDay][m.id]);
-          if (other && placeOnDay(altDay, chore, other)) { placed = true; break; }
+          if (other && placeOnDay(altDay, chore, other)) { placed = true; chorePlacedDays.add(altDay); break; }
         }
       }
       if (!placed) unscheduled.push({ choreId: chore.id, choreName: chore.name, day });
