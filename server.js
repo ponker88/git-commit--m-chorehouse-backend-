@@ -681,10 +681,20 @@ cron.schedule("0 * * * *", async () => {
     const data = await loadData();
     // loadData() now guarantees taskReminders is a plain object, but guard anyway.
     const reminders = data.taskReminders || {};
+    // Build a quick lookup of task done-state from data.tasks so we can
+    // stop reminders for tasks marked done via the app OR the email link.
+    const taskDoneById = Object.fromEntries(
+      (data.tasks || []).map((t) => [String(t.id), !!t.done])
+    );
     let changed = false;
     for (const id of Object.keys(reminders)) {
       const entry = reminders[id];
-      if (!entry || entry.done) { delete data.taskReminders[id]; changed = true; continue; }
+      // Stop if reminder entry is marked done, or if the underlying task is done.
+      if (!entry || entry.done || taskDoneById[id]) {
+        delete data.taskReminders[id];
+        changed = true;
+        continue;
+      }
       try {
         await sendTaskEmail(entry.member, entry.task, entry.token || makeToken());
         console.log("Hourly reminder sent: " + entry.task.title + " -> " + entry.member.name);
