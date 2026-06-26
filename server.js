@@ -567,7 +567,18 @@ app.post("/data", async (req, res) => {
         };
       });
     }
-    if (tasks) data.tasks = tasks;
+    if (tasks) {
+      // When tasks are saved, remove any taskReminders for tasks that no
+      // longer exist or are marked done — prevents orphaned hourly reminders.
+      const taskIds = new Set(tasks.map((t) => String(t.id)));
+      for (const id of Object.keys(data.taskReminders)) {
+        const task = tasks.find((t) => String(t.id) === id);
+        if (!taskIds.has(id) || task?.done) {
+          delete data.taskReminders[id];
+        }
+      }
+      data.tasks = tasks;
+    }
     if (alertTimes) data.alertTimes = alertTimes;
     if (alertEnabled) data.alertEnabled = alertEnabled;
     await saveData(data);
@@ -730,6 +741,25 @@ app.get("/task-done/:token", async (req, res) => {
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString() }));
+
+// One-time cleanup: remove taskReminders for tasks that no longer exist or are done.
+app.post("/admin/cleanup-reminders", async (req, res) => {
+  try {
+    const data = await loadData();
+    const taskIds = new Set((data.tasks || []).filter(t => !t.done).map(t => String(t.id)));
+    let removed = 0;
+    for (const id of Object.keys(data.taskReminders)) {
+      if (!taskIds.has(id)) {
+        delete data.taskReminders[id];
+        removed++;
+      }
+    }
+    await saveData(data);
+    res.json({ ok: true, removed, remaining: Object.keys(data.taskReminders).length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // ── Start ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
